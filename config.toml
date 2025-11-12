@@ -1,0 +1,11 @@
+[package]
+name = "serde"
+version = "1.0.0"
+
+[repository]
+url = "https://crates.io/api/v1/crates"
+use_test_repository = true
+test_repository_path = ""
+
+[analysis]
+max_depth = 3
