@@ -3,60 +3,61 @@ import tomllib
 import json
 import urllib.request
 import sys
+import os
 from collections import deque, defaultdict
 
 class ConfigError(Exception):
     pass
 
+def get_user_input():
+    """Интерактивный ввод параметров от пользователя"""
+    
+    use_test_repo = input("Тестовый репозиторий? (y/n): ").lower().strip() == 'y'
+    
+    config = {}
+    config['use_test_repository'] = use_test_repo
+    
+    if use_test_repo:
+        test_path = input("Файл графа: ").strip()
+        config['test_repository_path'] = test_path if test_path else "demo"
+        config['package_name'] = "A"  # По умолчанию начинаем с A
+        config['package_version'] = "1.0"
+        
+    else:
+        config['package_name'] = input("Пакет: ").strip()
+        config['package_version'] = input("Версия: ").strip()
+        repo_url = input("URL репозитория: ").strip()
+        config['repository_url'] = repo_url if repo_url else "https://crates.io/api/v1/crates"
+    
+    max_depth_input = input("Макс глубина: ").strip()
+    if not max_depth_input:
+        config['max_depth'] = float('inf')
+    else:
+        config['max_depth'] = int(max_depth_input)
+    
+    return config
+
 def load_config(config_path="config.toml"):
-    """Загрузка и валидация конфигурации из TOML файла"""
+    """Загрузка конфигурации из TOML файла"""
     try:
         with open(config_path, 'rb') as f:
             config = tomllib.load(f)
     except FileNotFoundError:
-        raise ConfigError(f"Конфигурационный файл не найден: {config_path}")
+        raise ConfigError(f"Файл не найден: {config_path}")
     except tomllib.TOMLDecodeError as e:
-        raise ConfigError(f"Ошибка парсинга TOML: {e}")
-    
-    required_sections = ['package', 'repository', 'analysis']
-    for section in required_sections:
-        if section not in config:
-            raise ConfigError(f"Отсутствует обязательная секция: {section}")
-    
-    pkg = config['package']
-    if 'name' not in pkg or not pkg['name']:
-        raise ConfigError("Не указано имя пакета")
-    if 'version' not in pkg or not pkg['version']:
-        raise ConfigError("Не указана версия пакета")
-    
-    repo = config['repository']
-    if 'url' not in repo or not repo['url']:
-        raise ConfigError("Не указан URL репозитория")
-    if 'use_test_repository' not in repo:
-        raise ConfigError("Не указан режим тестового репозитория")
-    
-    analysis = config['analysis']
-    if 'max_depth' not in analysis:
-        raise ConfigError("Не указана максимальная глубина анализа")
-    
-    try:
-        max_depth = int(analysis['max_depth'])
-        if max_depth <= 0:
-            raise ConfigError("Максимальная глубина должна быть положительным числом")
-    except (ValueError, TypeError):
-        raise ConfigError("Максимальная глубина должна быть целым числом")
+        raise ConfigError(f"Ошибка TOML: {e}")
     
     return {
-        'package_name': pkg['name'],
-        'package_version': pkg['version'],
-        'repository_url': repo['url'],
-        'use_test_repository': repo['use_test_repository'],
-        'test_repository_path': repo.get('test_repository_path', ''),
-        'max_depth': analysis['max_depth']
+        'package_name': config['package']['name'],
+        'package_version': config['package']['version'],
+        'repository_url': config['repository']['url'],
+        'use_test_repository': config['repository']['use_test_repository'],
+        'test_repository_path': config['repository'].get('test_repository_path', ''),
+        'max_depth': config['analysis']['max_depth']
     }
 
 def fetch_cargo_dependencies(package_name, version, repository_url):
-    """Получение зависимостей Rust пакета из crates.io API"""
+    """Получение зависимостей из crates.io API"""
     try:
         url = f"{repository_url}/{package_name}/{version}/dependencies"
         with urllib.request.urlopen(url) as response:
@@ -74,109 +75,154 @@ def fetch_cargo_dependencies(package_name, version, repository_url):
     except Exception as e:
         raise ConfigError(f"Ошибка получения зависимостей: {e}")
 
-def load_test_dependencies(test_repository_path):
+def load_test_dependencies_from_file(file_path):
     """Загрузка тестовых зависимостей из файла"""
-    try:
-        # Тестовый граф с циклическими зависимостями для демонстрации
-        test_graph = {
-            'A': ['B', 'C'],
-            'B': ['D'],
-            'C': ['D', 'E'],
-            'D': ['F'],
-            'E': ['A'],  # Циклическая зависимость A -> C -> E -> A
-            'F': []
-        }
-        return test_graph
-    except Exception as e:
-        raise ConfigError(f"Ошибка загрузки тестового репозитория: {e}")
+    if not os.path.exists(file_path):
+        return load_demo_dependencies()
+    
+    graph = {}
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line and ':' in line:
+                package, deps_str = line.split(':', 1)
+                package = package.strip()
+                dependencies = [dep.strip() for dep in deps_str.split(',') if dep.strip()]
+                graph[package] = dependencies
+    return graph
+
+def load_demo_dependencies():
+    """Демонстрационный граф зависимостей"""
+    return {
+        'A': ['B', 'C'],
+        'B': ['D'],
+        'C': ['A', 'E'],  # Цикл A -> C -> A
+        'D': ['F'],
+        'E': ['G'],
+        'F': ['B'],       # Цикл B -> D -> F -> B
+        'G': []
+    }
 
 def build_dependency_graph_bfs(root_package, root_version, repository_url, max_depth, use_test_repo, test_repo_path):
-    """Построение графа зависимостей алгоритмом BFS с рекурсией"""
+    """Построение графа зависимостей BFS с рекурсией"""
     graph = defaultdict(list)
-    visited = set()
-    cycles_detected = set()
+    visited = {}
+    cycles_detected = []
+    depth_info = {}
     
-    def bfs_recursive(package, version, depth):
-        if depth > max_depth:
+    def bfs_recursive(package, version, current_depth):
+        if current_depth > max_depth:
             return
         
-        package_key = (package, version)
+        package_key = f"{package}@{version}"
+        
         if package_key in visited:
-            cycles_detected.add(package_key)
+            cycles_detected.append(f"{package_key} -> ... -> {package_key}")
             return
         
-        visited.add(package_key)
+        visited[package_key] = current_depth
+        depth_info[package_key] = current_depth
         
         try:
-            # Получаем зависимости в зависимости от режима
             if use_test_repo:
-                dependencies = load_test_dependencies(test_repo_path)
-                deps_list = dependencies.get(package, [])
-                # Преобразуем в тот же формат, что и реальные зависимости
-                dependencies_data = [{'name': dep, 'version_req': '1.0'} for dep in deps_list]
-            else:
-                dependencies_data = fetch_cargo_dependencies(package, version, repository_url)
-            
-            for dep in dependencies_data:
-                dep_key = (dep['name'], dep['version_req'])
-                graph[package_key].append(dep_key)
+                if test_repo_path and test_repo_path != "demo":
+                    dependencies_data = load_test_dependencies_from_file(test_repo_path)
+                else:
+                    dependencies_data = load_demo_dependencies()
                 
-                # Рекурсивный вызов BFS для зависимостей
-                bfs_recursive(dep['name'], dep['version_req'], depth + 1)
+                deps_list = dependencies_data.get(package, [])
+                dependencies = [{'name': dep, 'version_req': '1.0'} for dep in deps_list]
+            else:
+                dependencies = fetch_cargo_dependencies(package, version, repository_url)
+            
+            for dep in dependencies:
+                dep_key = f"{dep['name']}@{dep['version_req']}"
+                graph[package_key].append(dep_key)
+                bfs_recursive(dep['name'], dep['version_req'], current_depth + 1)
                 
         except Exception as e:
-            print(f"Предупреждение: не удалось получить зависимости для {package}: {e}")
+            print(f"Ошибка для {package}: {e}")
+        
+        visited.pop(package_key)
     
-    # Запускаем BFS с корневого пакета
     bfs_recursive(root_package, root_version, 0)
+    return graph, cycles_detected, depth_info
+
+def print_dependency_tree(graph, cycles, depth_info, root_package, max_depth):
+    """Вывод дерева зависимостей"""
+    print(f"\nГраф для {root_package}")
+    print(f"Глубина: {max_depth if max_depth != float('inf') else 'не ограничена'}")
+    print(f"Пакетов: {len(graph)}")
     
-    return graph, cycles_detected
+    packages_by_depth = defaultdict(list)
+    for package, depth in depth_info.items():
+        packages_by_depth[depth].append(package)
+    
+    for depth in sorted(packages_by_depth.keys()):
+        print(f"\nУровень {depth}:")
+        for package in sorted(packages_by_depth[depth]):
+            deps = graph.get(package, [])
+            indent = "  " * depth
+            if deps:
+                print(f"{indent}{package} -> {', '.join(deps)}")
+            else:
+                print(f"{indent}{package}")
+    
+    if cycles:
+        print(f"\nЦиклы: {len(cycles)}")
+        for cycle in cycles:
+            print(f"  {cycle}")
+
+def save_graph_to_file(graph, cycles, depth_info, root_package, max_depth, filename):
+    """Сохранение графа в файл"""
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(f"# Граф для {root_package}\n")
+            f.write(f"# Глубина: {max_depth if max_depth != float('inf') else 'не ограничена'}\n")
+            f.write(f"# Пакетов: {len(graph)}\n")
+            
+            for package, dependencies in graph.items():
+                if dependencies:
+                    f.write(f"{package}: {', '.join(dependencies)}\n")
+            
+            if cycles:
+                f.write("\n# Циклы:\n")
+                for cycle in cycles:
+                    f.write(f"# {cycle}\n")
+        
+        print(f"Сохранено: {filename}")
+    except Exception as e:
+        print(f"Ошибка сохранения: {e}")
 
 def main():
-    """Основная функция - построение графа зависимостей"""
+    """Основная функция"""
     try:
-        config = load_config()
+        if len(sys.argv) > 1 and sys.argv[1] == "--config":
+            config_path = sys.argv[2] if len(sys.argv) > 2 else "config.toml"
+            config = load_config(config_path)
+        else:
+            config = get_user_input()
         
-        print("=== ЭТАП 3: Основные операции ===")
-        print(f"Построение графа для: {config['package_name']} {config['package_version']}")
-        print(f"Максимальная глубина: {config['max_depth']}")
-        print(f"Режим тестирования: {config['use_test_repository']}")
-        
-        # Строим граф зависимостей
-        graph, cycles = build_dependency_graph_bfs(
+        graph, cycles, depth_info = build_dependency_graph_bfs(
             config['package_name'],
-            config['package_version'],
-            config['repository_url'],
+            config.get('package_version', '1.0'),
+            config.get('repository_url', 'https://crates.io/api/v1/crates'),
             config['max_depth'],
             config['use_test_repository'],
-            config['test_repository_path']
+            config.get('test_repository_path', '')
         )
         
-        # Выводим граф
-        print("\nГраф зависимостей:")
-        for package, dependencies in graph.items():
-            dep_names = [dep[0] for dep in dependencies]
-            print(f"  {package[0]} -> {dep_names}")
+        root_package_key = f"{config['package_name']}@{config.get('package_version', '1.0')}"
+        print_dependency_tree(graph, cycles, depth_info, root_package_key, config['max_depth'])
         
-        # Обрабатываем циклические зависимости
-        if cycles:
-            print(f"\nОбнаружены циклические зависимости ({len(cycles)}):")
-            for cycle_package in cycles:
-                print(f"  - {cycle_package[0]}")
-        else:
-            print("\nЦиклические зависимости не обнаружены")
+        output_file = f"dep_{config['package_name']}.txt"
+        save_graph_to_file(graph, cycles, depth_info, root_package_key, config['max_depth'], output_file)
         
-        # Демонстрация работы с тестовым репозиторием
-        if config['use_test_repository']:
-            print("\n=== Демонстрация на тестовом репозитории ===")
-            print("Тестовый граф: A -> B, C; B -> D; C -> D, E; D -> F; E -> A")
-            print("Обнаружен цикл: A -> C -> E -> A")
-            
     except ConfigError as e:
-        print(f"Ошибка конфигурации: {e}", file=sys.stderr)
+        print(f"Ошибка: {e}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
-        print(f"Неожиданная ошибка: {e}", file=sys.stderr)
+        print(f"Ошибка: {e}", file=sys.stderr)
         sys.exit(1)
 
 if __name__ == "__main__":
