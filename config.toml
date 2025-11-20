@@ -1,10 +1,10 @@
 [package]
 name = "serde"
-version = "1.0.0"
+version = "1.0"
 
 [repository]
 url = "https://crates.io/api/v1/crates"
-use_test_repository = true
+use_test_repository = false
 test_repository_path = ""
 
 [analysis]
